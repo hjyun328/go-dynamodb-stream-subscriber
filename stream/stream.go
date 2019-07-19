@@ -237,7 +237,7 @@ func (r *StreamSubscriber) processShard(input *dynamodbstreams.GetShardIteratorI
 			ShardIterator: nextIterator,
 			Limit:         r.Limit,
 		})
-		if awsErr, ok := err.(awserr.Error); ok && awsErr.Code() == "TrimmedDataAccessException" {
+		if awsErr, ok := err.(awserr.Error); ok && awsErr.Code() == dynamodbstreams.ErrCodeTrimmedDataAccessException {
 			//Trying to request data older than 24h, that's ok
 			//http://docs.aws.amazon.com/dynamodbstreams/latest/APIReference/API_GetShardIterator.html -> Errors
 			return nil
