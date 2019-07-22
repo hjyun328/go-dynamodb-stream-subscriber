@@ -4,9 +4,8 @@ package stream
 
 import (
 	"errors"
-	"time"
-
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -90,10 +89,9 @@ func (r *StreamSubscriber) GetStreamDataAsync() (<-chan *dynamodbstreams.Record,
 	needUpdateChannel := make(chan struct{}, 1)
 	needUpdateChannel <- struct{}{}
 
-	allShards := make(map[string]struct{})
+	allShards := new(sync.Map)
 	shardProcessingLimit := 5
 	shardsCh := make(chan *dynamodbstreams.GetShardIteratorInput, shardProcessingLimit)
-	lock := sync.Mutex{}
 
 	go func() {
 		tick := time.NewTicker(time.Minute)
@@ -120,16 +118,13 @@ func (r *StreamSubscriber) GetStreamDataAsync() (<-chan *dynamodbstreams.Record,
 					return
 				}
 				for _, sObj := range ids {
-					lock.Lock()
-					if _, ok := allShards[*sObj.ShardId]; !ok {
-						allShards[*sObj.ShardId] = struct{}{}
+					if _, ok := allShards.LoadOrStore(*sObj.ShardId, struct{}{}); !ok {
 						shardsCh <- &dynamodbstreams.GetShardIteratorInput{
 							StreamArn:         streamArn,
 							ShardId:           sObj.ShardId,
 							ShardIteratorType: r.ShardIteratorType,
 						}
 					}
-					lock.Unlock()
 				}
 
 			}
@@ -148,7 +143,7 @@ func (r *StreamSubscriber) GetStreamDataAsync() (<-chan *dynamodbstreams.Record,
 				if err != nil {
 					errCh <- err
 				}
-				// TODO: think about cleaning list of shards: delete(allShards, *sInput.ShardId)
+				// TODO: think about cleaning list of shards: allShards.Delete(*sInput.ShardId)
 				<-limit
 			}(shardInput)
 		}
