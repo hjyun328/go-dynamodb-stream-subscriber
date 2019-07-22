@@ -21,6 +21,7 @@ type StreamSubscriber struct {
 	table             *string
 	ShardIteratorType *string
 	Limit             *int64
+	KeepOrder         *bool
 }
 
 func NewStreamSubscriber(
@@ -36,6 +37,9 @@ func (r *StreamSubscriber) applyDefaults() {
 	if r.ShardIteratorType == nil {
 		r.ShardIteratorType = aws.String(dynamodbstreams.ShardIteratorTypeLatest)
 	}
+	if r.KeepOrder == nil {
+		r.SetKeepOrder(false)
+	}
 }
 
 func (r *StreamSubscriber) SetLimit(v int64) {
@@ -44,6 +48,10 @@ func (r *StreamSubscriber) SetLimit(v int64) {
 
 func (r *StreamSubscriber) SetShardIteratorType(s string) {
 	r.ShardIteratorType = aws.String(s)
+}
+
+func (r *StreamSubscriber) SetKeepOrder(b bool) {
+	r.KeepOrder = aws.Bool(b)
 }
 
 func (r *StreamSubscriber) GetStreamData() (<-chan *dynamodbstreams.Record, <-chan error) {
@@ -118,11 +126,17 @@ func (r *StreamSubscriber) GetStreamDataAsync() (<-chan *dynamodbstreams.Record,
 					return
 				}
 				for _, sObj := range ids {
-					if _, ok := allShards.LoadOrStore(*sObj.ShardId, struct{}{}); !ok {
-						shardsCh <- &dynamodbstreams.GetShardIteratorInput{
-							StreamArn:         streamArn,
-							ShardId:           sObj.ShardId,
-							ShardIteratorType: r.ShardIteratorType,
+					// Consume the child shard after its parent shard is completed
+					// Parent shard must be processed before its children to ensure that
+					// the stream records are also processed in the correct order.
+					// More Details https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html
+					if parentCompleted, parentExist := allShards.Load(*sObj.ParentShardId); !(*r.KeepOrder && parentExist && !isTrue(parentCompleted)) {
+						if _, ok := allShards.LoadOrStore(*sObj.ShardId, struct{}{}); !ok {
+							shardsCh <- &dynamodbstreams.GetShardIteratorInput{
+								StreamArn:         streamArn,
+								ShardId:           sObj.ShardId,
+								ShardIteratorType: r.ShardIteratorType,
+							}
 						}
 					}
 				}
@@ -143,7 +157,8 @@ func (r *StreamSubscriber) GetStreamDataAsync() (<-chan *dynamodbstreams.Record,
 				if err != nil {
 					errCh <- err
 				}
-				// TODO: think about cleaning list of shards: allShards.Delete(*sInput.ShardId)
+				// Mark the shard is completed
+				allShards.Store(*sInput.ShardId, true)
 				<-limit
 			}(shardInput)
 		}
