@@ -1,4 +1,6 @@
 # go-dynamodb-stream-subscriber
+
+## Usage
 Go channel for streaming Dynamodb Updates
 
 ```go
@@ -34,3 +36,10 @@ func main() {
 	}
 }
 ```
+
+## Deployment
+
+If using this in actual deployment. There is a throttle on the shard implementation on AWS. That means that if you have a large deployment and have multiple calls towards the same shard AWS may very well throttle the calls resulting in ProvisionedThroughputExceededException and triggering a back-off.
+
+The solution (before actually doing this) may be to have a 1:1 connection of applicatoin and shard to guarantee not hitting the limit.
+

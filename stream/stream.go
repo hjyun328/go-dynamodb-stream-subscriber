@@ -4,6 +4,7 @@ package stream
 
 import (
 	"errors"
+	"log"
 	"sync"
 	"time"
 
@@ -130,7 +131,22 @@ func (r *StreamSubscriber) GetStreamDataAsync() (<-chan *dynamodbstreams.Record,
 					// Parent shard must be processed before its children to ensure that
 					// the stream records are also processed in the correct order.
 					// More Details https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html
-					if parentCompleted, parentExist := allShards.Load(*sObj.ParentShardId); !(*r.KeepOrder && parentExist && !isTrue(parentCompleted)) {
+					if sObj.ParentShardId != nil {
+						if parentCompleted, parentExist := allShards.Load(*sObj.ParentShardId); !(*r.KeepOrder && parentExist && !isTrue(parentCompleted)) {
+							if _, ok := allShards.LoadOrStore(*sObj.ShardId, struct{}{}); !ok {
+								shardsCh <- &dynamodbstreams.GetShardIteratorInput{
+									StreamArn:         streamArn,
+									ShardId:           sObj.ShardId,
+									ShardIteratorType: r.ShardIteratorType,
+								}
+							}
+						}
+					} else {
+						// This may not be the correct solution here. But rather go through all shards and mark them as
+						// not processed then afterwards see whether we processed any shards. If not we only have dangling
+						// children and go back and process them. However, I think this only occurs if we only have one
+						// shard.
+						log.Println("Shard don't have parent")
 						if _, ok := allShards.LoadOrStore(*sObj.ShardId, struct{}{}); !ok {
 							shardsCh <- &dynamodbstreams.GetShardIteratorInput{
 								StreamArn:         streamArn,
@@ -149,7 +165,7 @@ func (r *StreamSubscriber) GetStreamDataAsync() (<-chan *dynamodbstreams.Record,
 	limit := make(chan struct{}, shardProcessingLimit)
 
 	go func() {
-		time.Sleep(time.Second * 10)
+		time.Sleep(time.Second)
 		for shardInput := range shardsCh {
 			limit <- struct{}{}
 			go func(sInput *dynamodbstreams.GetShardIteratorInput) {
