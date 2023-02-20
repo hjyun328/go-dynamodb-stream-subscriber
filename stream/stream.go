@@ -9,25 +9,32 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams/types"
-	"log"
 	"sync"
 	"time"
 )
 
 type StreamSubscriber struct {
-	dynamoSvc         DynamoService
-	streamSvc         StreamService
-	table             *string
-	ShardIteratorType types.ShardIteratorType
-	Limit             *int32
-	KeepOrder         *bool
+	dynamoSvc            DynamoService
+	streamSvc            StreamService
+	table                *string
+	ShardIteratorType    types.ShardIteratorType
+	ShardProcessingLimit *int
+	Limit                *int32
+	KeepOrder            *bool
+	shutdownCh           chan struct{}
+	closeChannelOnce     sync.Once
 }
 
 func NewStreamSubscriber(
 	dynamoSvc DynamoService,
 	streamSvc StreamService,
 	table string) *StreamSubscriber {
-	s := &StreamSubscriber{dynamoSvc: dynamoSvc, streamSvc: streamSvc, table: &table}
+	s := &StreamSubscriber{
+		shutdownCh: make(chan struct{}),
+		dynamoSvc:  dynamoSvc,
+		streamSvc:  streamSvc,
+		table:      &table,
+	}
 	s.applyDefaults()
 	return s
 }
@@ -39,6 +46,10 @@ func (r *StreamSubscriber) applyDefaults() {
 	if r.KeepOrder == nil {
 		r.SetKeepOrder(false)
 	}
+	if r.ShardProcessingLimit == nil || *r.ShardProcessingLimit == 0 {
+		r.ShardProcessingLimit = aws.Int(5)
+	}
+
 }
 
 func (r *StreamSubscriber) SetLimit(v int32) {
@@ -49,8 +60,16 @@ func (r *StreamSubscriber) SetShardIteratorType(shardIteratorType types.ShardIte
 	r.ShardIteratorType = shardIteratorType
 }
 
+func (r *StreamSubscriber) SetShardProcessingLimit(shardProcessingLimit int) {
+	r.ShardProcessingLimit = aws.Int(shardProcessingLimit)
+}
+
 func (r *StreamSubscriber) SetKeepOrder(b bool) {
 	r.KeepOrder = aws.Bool(b)
+}
+
+func (r *StreamSubscriber) Shutdown() {
+	close(r.shutdownCh)
 }
 
 func (r *StreamSubscriber) GetStreamData() (<-chan *types.Record, <-chan error) {
@@ -77,10 +96,14 @@ func (r *StreamSubscriber) GetStreamData() (<-chan *types.Record, <-chan error) 
 					shardId = prevShardId
 				}
 			}
-			if shardId == nil {
-				time.Sleep(time.Second * 10)
+			select {
+			case _ = <-r.shutdownCh:
+				return
+			default:
+				if shardId == nil {
+					time.Sleep(time.Second * 10)
+				}
 			}
-
 		}
 	}(ch, errCh)
 
@@ -95,13 +118,14 @@ func (r *StreamSubscriber) GetStreamDataAsync() (<-chan *types.Record, <-chan er
 	needUpdateChannel <- struct{}{}
 
 	allShards := new(sync.Map)
-	shardProcessingLimit := 5
-	shardsCh := make(chan *dynamodbstreams.GetShardIteratorInput, shardProcessingLimit)
+	shardsCh := make(chan *dynamodbstreams.GetShardIteratorInput, *r.ShardProcessingLimit)
 
 	go func() {
-		tick := time.NewTicker(time.Minute)
+		tick := time.NewTicker(1 * time.Minute)
 		for {
 			select {
+			case <-r.shutdownCh:
+				return
 			case <-tick.C:
 				needUpdateChannel <- struct{}{}
 			}
@@ -111,6 +135,8 @@ func (r *StreamSubscriber) GetStreamDataAsync() (<-chan *types.Record, <-chan er
 	go func() {
 		for {
 			select {
+			case <-r.shutdownCh:
+				return
 			case <-needUpdateChannel:
 				streamArn, err := r.getLatestStreamArn()
 				if err != nil {
@@ -128,6 +154,7 @@ func (r *StreamSubscriber) GetStreamDataAsync() (<-chan *types.Record, <-chan er
 					// the stream records are also processed in the correct order.
 					// More Details https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html
 					if sObj.ParentShardId != nil {
+						// FIXME: Although "parentExists" is false, Parent shard might be at the end of shard ids array. So it doesn't work with "KeepOrder".
 						if parentCompleted, parentExist := allShards.Load(*sObj.ParentShardId); !(*r.KeepOrder && parentExist && !isTrue(parentCompleted)) {
 							if _, ok := allShards.LoadOrStore(*sObj.ShardId, struct{}{}); !ok {
 								shardsCh <- &dynamodbstreams.GetShardIteratorInput{
@@ -142,7 +169,6 @@ func (r *StreamSubscriber) GetStreamDataAsync() (<-chan *types.Record, <-chan er
 						// not processed then afterwards see whether we processed any shards. If not we only have dangling
 						// children and go back and process them. However, I think this only occurs if we only have one
 						// shard.
-						log.Println("Shard don't have parent")
 						if _, ok := allShards.LoadOrStore(*sObj.ShardId, struct{}{}); !ok {
 							shardsCh <- &dynamodbstreams.GetShardIteratorInput{
 								StreamArn:         streamArn,
@@ -152,29 +178,40 @@ func (r *StreamSubscriber) GetStreamDataAsync() (<-chan *types.Record, <-chan er
 						}
 					}
 				}
-
 			}
 		}
-
 	}()
 
-	limit := make(chan struct{}, shardProcessingLimit)
-
+	limit := make(chan struct{}, *r.ShardProcessingLimit)
 	go func() {
-		time.Sleep(time.Second)
-		for shardInput := range shardsCh {
-			limit <- struct{}{}
-			go func(sInput *dynamodbstreams.GetShardIteratorInput) {
-				err := r.processShard(sInput, ch)
-				if err != nil {
-					errCh <- err
-				}
-				// Mark the shard is completed
-				allShards.Store(*sInput.ShardId, true)
-				<-limit
-			}(shardInput)
+		for {
+			select {
+			case _ = <-r.shutdownCh:
+				return
+			case shardInput := <-shardsCh:
+				limit <- struct{}{}
+				go func(sInput *dynamodbstreams.GetShardIteratorInput) {
+					if err := r.processShard(sInput, ch); err != nil {
+						errCh <- err
+					}
+					// Mark the shard is completed
+					allShards.Store(*sInput.ShardId, true)
+					<-limit
+					select {
+					case _ = <-r.shutdownCh:
+						if len(limit) == 0 {
+							r.closeChannelOnce.Do(func() {
+								close(ch)
+								close(errCh)
+							})
+						}
+					default:
+					}
+				}(shardInput)
+			}
 		}
 	}()
+
 	return ch, errCh
 }
 
@@ -253,18 +290,17 @@ func (r *StreamSubscriber) processShard(input *dynamodbstreams.GetShardIteratorI
 	}
 
 	nextIterator := iter.ShardIterator
-
 	for nextIterator != nil {
 		recs, err := r.streamSvc.GetRecords(context.Background(), &dynamodbstreams.GetRecordsInput{
 			ShardIterator: nextIterator,
 			Limit:         r.Limit,
 		})
-		if _, ok := err.(*types.TrimmedDataAccessException); ok {
-			//Trying to request data older than 24h, that's ok
-			//http://docs.aws.amazon.com/dynamodbstreams/latest/APIReference/API_GetShardIterator.html -> Errors
-			return nil
-		}
 		if err != nil {
+			if _, ok := err.(*types.TrimmedDataAccessException); ok {
+				// Trying to request data older than 24h, that's ok
+				// http://docs.aws.amazon.com/dynamodbstreams/latest/APIReference/API_GetShardIterator.html -> Errors
+				return nil
+			}
 			return err
 		}
 
@@ -275,7 +311,6 @@ func (r *StreamSubscriber) processShard(input *dynamodbstreams.GetShardIteratorI
 		nextIterator = recs.NextShardIterator
 
 		sleepDuration := time.Second
-
 		// Nil next itarator, shard is closed
 		if nextIterator == nil {
 			sleepDuration = time.Millisecond * 10
@@ -284,7 +319,13 @@ func (r *StreamSubscriber) processShard(input *dynamodbstreams.GetShardIteratorI
 			sleepDuration = time.Second * 10
 		}
 
-		time.Sleep(sleepDuration)
+		after := time.After(sleepDuration)
+		select {
+		case _ = <-r.shutdownCh:
+			return nil
+		case _ = <-after:
+		}
 	}
+
 	return nil
 }
