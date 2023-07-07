@@ -4,7 +4,7 @@
 Go channel for streaming Dynamodb Updates
 
 ```go
-package dynamo
+package main
 
 import (
 	"context"
