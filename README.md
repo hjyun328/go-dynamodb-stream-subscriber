@@ -4,36 +4,61 @@
 Go channel for streaming Dynamodb Updates
 
 ```go
-package main
+package dynamo
 
 import (
+	"context"
 	"fmt"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
-	"github.com/aws/aws-sdk-go/service/dynamodbstreams"
-	"github.com/urakozz/go-dynamodb-stream-subscriber/stream"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams/types"
+	"time"
 )
 
 func main() {
-	cfg := aws.NewConfig().WithRegion("eu-west-1")
-	sess := session.New()
-	streamSvc := dynamodbstreams.New(sess, cfg)
-	dynamoSvc := dynamodb.New(sess, cfg)
-	table := "tableName"
+	region := "ap-northeast-2"
+	table := "test"
 
-	streamSubscriber := stream.NewStreamSubscriber(dynamoSvc, streamSvc, table)
-	ch, errCh := streamSubscriber.GetStreamDataAsync()
-
-	go func(errCh <-chan error) {
-		for err := range errCh {
-			fmt.Println("Stream Subscriber error: ", err)
-		}
-	}(errCh)
-
-	for record := range ch {
-		fmt.Println("from channel:", record)
+	cfg, err := config.LoadDefaultConfig(
+		context.Background(),
+		config.WithRegion(region),
+	)
+	if err != nil {
+		panic(err)
 	}
+
+	streamCfg, err := config.LoadDefaultConfig(
+		context.Background(),
+		config.WithRegion(region),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	subscriber := stream.NewStreamSubscriber(
+		table,
+		dynamodb.NewFromConfig(cfg),
+		dynamodbstreams.NewFromConfig(streamCfg),
+	)
+	recordCh, errCh := subscriber.GetStreamData()
+
+	go func() {
+		for record := range recordCh {
+			fmt.Println("from record channel: ", record)
+		}
+	}()
+
+	go func() {
+		for err := range errCh {
+			fmt.Println("from error channel: ", err)
+		}
+	}()
+
+	time.Sleep(100 * time.Second)
+	
+	subscriber.Shutdown()
 }
 ```
 
