@@ -21,7 +21,8 @@ type Subscriber struct {
 	dynamoSvc DynamoService
 	streamSvc StreamService
 
-	shards sync.Map
+	shards     sync.Map
+	shardCount int
 
 	shardProcessQueue chan *shardProcessContext
 
@@ -68,9 +69,11 @@ func (r *Subscriber) applyDefaults() {
 }
 
 func (r *Subscriber) SetShardSequences(shardSequences []*ShardSequence) {
-	for _, shardSequence := range shardSequences {
-		if len(shardSequence.SequenceNumber) > 0 {
-			r.shards.Store(shardSequence.ShardId, shardSequence.SequenceNumber)
+	if r.shardCount == 0 {
+		for _, shardSequence := range shardSequences {
+			if len(shardSequence.SequenceNumber) > 0 {
+				r.shards.Store(shardSequence.ShardId, shardSequence.SequenceNumber)
+			}
 		}
 	}
 }
@@ -211,37 +214,37 @@ func (r *Subscriber) Subscribe() (<-chan *types.Record, <-chan error) {
 					r.sendError(err)
 					continue
 				}
-				if first {
-					r.shards.Range(func(key any, value any) bool {
-						shardId := key.(string)
-						sequenceNumber := value.(string)
-						r.shardProcessQueue <- newShardProcessContext(
-							&dynamodbstreams.GetShardIteratorInput{
-								StreamArn:         streamArn,
-								ShardIteratorType: r.shardSequenceIteratorType,
-								ShardId:           &shardId,
-								SequenceNumber:    &sequenceNumber,
-							},
-							r.shardIteratorInitialInterval,
-							r.shardIteratorMaxInterval,
-						)
-						return true
-					})
-					first = false
-				}
 				for _, shard := range shards {
+					var sequenceNumber *string
+					shardIteratorType := r.shardIteratorType
+
+					if first {
+						sqn, ok := r.shards.Load(*shard.ShardId)
+						if ok {
+							shardIteratorType = r.shardSequenceIteratorType
+							sequenceNumberStr := sqn.(string)
+							sequenceNumber = &sequenceNumberStr
+							r.shards.Delete(*shard.ShardId)
+						} else {
+							shardIteratorType = r.shardIteratorType
+						}
+					}
+
 					if _, exist := r.shards.LoadOrStore(*shard.ShardId, ""); !exist {
+						r.shardCount++
 						r.shardProcessQueue <- newShardProcessContext(
 							&dynamodbstreams.GetShardIteratorInput{
 								StreamArn:         streamArn,
-								ShardIteratorType: r.shardIteratorType,
+								ShardIteratorType: shardIteratorType,
 								ShardId:           shard.ShardId,
+								SequenceNumber:    sequenceNumber,
 							},
 							r.shardIteratorInitialInterval,
 							r.shardIteratorMaxInterval,
 						)
 					}
 				}
+				first = false
 			}
 		}
 	}()
